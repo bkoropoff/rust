@@ -48,6 +48,7 @@ use option::{None, Option, Some};
 use rt::task::{Task, LocalStorage};
 use slice::{ImmutableVector, MutableVector};
 use vec::Vec;
+use ops::Drop;
 
 /**
  * Indexes a task-local data slot. This pointer is used for comparison to
@@ -225,6 +226,24 @@ fn get_with<T:'static,
     // is, allowing callers to acquire references to owned data. This is also
     // sound so long as measures are taken to ensure that while a TLS slot is
     // loaned out to a caller, it's not modified recursively.
+
+    struct LoanReturner {
+        return_loan: bool,
+        i: uint
+    }
+
+    impl Drop for LoanReturner {
+        fn drop(&mut self) {
+            if self.return_loan {
+                let map = unsafe { get_local_map() };
+                match *map.get_mut(self.i) {
+                    Some((_, _, ref mut loan)) => { *loan = NoLoan; }
+                    None => abort()
+                }
+            }
+        }
+    }
+   
     let map = unsafe { get_local_map() };
     let key_value = key_to_key_value(key);
 
@@ -237,13 +256,13 @@ fn get_with<T:'static,
         None => { return f(None); }
         Some(i) => {
             let ret;
-            let mut return_loan = false;
+            let mut returner = LoanReturner { return_loan: false, i: i };
             match *map.get_mut(i) {
                 Some((_, ref data, ref mut loan)) => {
                     match (state, *loan) {
                         (_, NoLoan) => {
                             *loan = state;
-                            return_loan = true;
+                            returner.return_loan = true;
                         }
                         (ImmLoan, ImmLoan) => {}
                         (want, cur) => {
@@ -267,16 +286,6 @@ fn get_with<T:'static,
                 _ => abort()
             }
 
-            // n.b. 'data' and 'loans' are both invalid pointers at the point
-            // 'f' returned because `f` could have appended more TLS items which
-            // in turn relocated the vector. Hence we do another lookup here to
-            // fixup the loans.
-            if return_loan {
-                match *map.get_mut(i) {
-                    Some((_, _, ref mut loan)) => { *loan = NoLoan; }
-                    None => abort()
-                }
-            }
             return ret;
         }
     }
