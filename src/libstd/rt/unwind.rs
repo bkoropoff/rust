@@ -64,7 +64,7 @@ use mem;
 use option::{Some, None, Option};
 use prelude::drop;
 use ptr::RawPtr;
-use result::{Err, Ok};
+use result::{Result, Err, Ok};
 use rt::backtrace;
 use rt::local::Local;
 use rt::task::Task;
@@ -91,19 +91,23 @@ impl Unwinder {
         self.unwinding
     }
 
-    pub fn try(&mut self, f: ||) {
+    pub fn try(&mut self, f: ||) -> TaskResult {
         use raw::Closure;
         use libc::{c_void};
 
-        unsafe {
+        let res = unsafe {
             let closure: Closure = cast::transmute(f);
             let ep = rust_try(try_fn, closure.code as *c_void,
                               closure.env as *c_void);
             if !ep.is_null() {
                 rtdebug!("caught {}", (*ep).exception_class);
                 uw::_Unwind_DeleteException(ep);
+                rtassert!(self.unwinding);
+                Err(self.cause.take().unwrap())
+            } else {
+                Ok(())
             }
-        }
+        };
 
         extern fn try_fn(code: *c_void, env: *c_void) {
             unsafe {
@@ -123,6 +127,18 @@ impl Unwinder {
             fn rust_try(f: extern "C" fn(*c_void, *c_void),
                         code: *c_void,
                         data: *c_void) -> *uw::_Unwind_Exception;
+        }
+
+        res
+    }
+
+    pub fn try_catch<T>(&mut self, f: || -> T) -> Result<T,~Any:Send> {
+        let mut res = None;
+        let caught = self.try(|| res = Some(f()));
+        self.unwinding = false;
+        match caught {
+            Ok(()) => Ok(res.unwrap()),
+            Err(e) => Err(e)
         }
     }
 
@@ -155,14 +171,6 @@ impl Unwinder {
                     let _: ~uw::_Unwind_Exception = cast::transmute(exception);
                 }
             }
-        }
-    }
-
-    pub fn result(&mut self) -> TaskResult {
-        if self.unwinding {
-            Err(self.cause.take().unwrap())
-        } else {
-            Ok(())
         }
     }
 }

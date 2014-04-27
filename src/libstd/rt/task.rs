@@ -13,7 +13,7 @@
 //! local storage, and logging. Even a 'freestanding' Rust would likely want
 //! to implement this.
 
-use any::AnyOwnExt;
+use any::{Any,AnyOwnExt};
 use cast;
 use cleanup;
 use clone::Clone;
@@ -177,15 +177,15 @@ impl Task {
             })
         };
 
-        unsafe { (*handle).unwinder.try(try_block); }
-
-        // Here we must unsafely borrow the task in order to not remove it from
-        // TLS. When collecting failure, we may attempt to send on a channel (or
-        // just run aribitrary code), so we must be sure to still have a local
-        // task in TLS.
         unsafe {
+            let res = (*handle).unwinder.try(try_block);
+
+            // Here we must unsafely borrow the task in order to not remove it from
+            // TLS. When collecting failure, we may attempt to send on a channel (or
+            // just run aribitrary code), so we must be sure to still have a local
+            // task in TLS.
             let me: *mut Task = Local::unsafe_borrow();
-            (*me).death.collect_failure((*me).unwinder.result());
+            (*me).death.collect_failure(res);
         }
         let mut me: ~Task = Local::take();
         me.destroyed = true;
@@ -393,6 +393,13 @@ impl Drop for Death {
     fn drop(&mut self) {
         // make this type noncopyable
     }
+}
+
+// HACK: allow recovering from task failure
+pub fn try_catch<T>(f: || -> T) -> Result<T,~Any:Send> {
+    let task: *mut Task = unsafe { Local::unsafe_borrow() };
+    let unwinder = unsafe { &mut (*task).unwinder };
+    unwinder.try_catch(f)
 }
 
 #[cfg(test)]
