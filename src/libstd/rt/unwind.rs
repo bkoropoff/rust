@@ -352,7 +352,7 @@ pub fn begin_unwind_fmt(msg: &fmt::Arguments, file: &'static str, line: uint) ->
     // required with the current scheme, and (b) we don't handle
     // failure + OOM properly anyway (see comment in begin_unwind
     // below).
-    begin_unwind_inner(~fmt::format(msg), file, line)
+    begin_unwind_inner(~fmt::format(msg), file, line, false)
 }
 
 /// This is the entry point of unwinding for fail!() and assert!().
@@ -366,9 +366,14 @@ pub fn begin_unwind<M: Any + Send>(msg: M, file: &'static str, line: uint) -> ! 
     // failing.
 
     // see below for why we do the `Any` coercion here.
-    begin_unwind_inner(~msg, file, line)
+    begin_unwind_inner(~msg, file, line, false)
 }
 
+// HACK: unwind without making a big fuss about it
+#[inline(never)] #[cold] // avoid code bloat at the call sites as much as possible
+pub fn begin_unwind_quiet<M: Any + Send>(msg: M, file: &'static str, line: uint) -> ! {
+    begin_unwind_inner(~msg, file, line, true)
+}
 
 /// The core of the unwinding.
 ///
@@ -380,7 +385,7 @@ pub fn begin_unwind<M: Any + Send>(msg: M, file: &'static str, line: uint) -> ! 
 /// Do this split took the LLVM IR line counts of `fn main() { fail!()
 /// }` from ~1900/3700 (-O/no opts) to 180/590.
 #[inline(never)] #[cold] // this is the slow path, please never inline this
-fn begin_unwind_inner(msg: ~Any:Send, file: &'static str, line: uint) -> ! {
+fn begin_unwind_inner(msg: ~Any:Send, file: &'static str, line: uint, quiet: bool) -> ! {
     let mut task;
     {
         let msg_s = match msg.as_ref::<&'static str>() {
@@ -413,46 +418,50 @@ fn begin_unwind_inner(msg: ~Any:Send, file: &'static str, line: uint) -> ! {
             }
         };
 
-        // See comments in io::stdio::with_task_stdout as to why we have to be
-        // careful when using an arbitrary I/O handle from the task. We
-        // essentially need to dance to make sure when a task is in TLS when
-        // running user code.
-        let name = task.name.take();
-        {
-            let n = name.as_ref().map(|n| n.as_slice()).unwrap_or("<unnamed>");
+        if !quiet {
+            // See comments in io::stdio::with_task_stdout as to why we have to be
+            // careful when using an arbitrary I/O handle from the task. We
+            // essentially need to dance to make sure when a task is in TLS when
+            // running user code.
+            let name = task.name.take();
+            {
+                let n = name.as_ref().map(|n| n.as_slice()).unwrap_or("<unnamed>");
 
-            match task.stderr.take() {
-                Some(mut stderr) => {
-                    Local::put(task);
-                    // FIXME: what to do when the task printing fails?
-                    let _err = format_args!(|args| ::fmt::writeln(stderr, args),
-                                            "task '{}' failed at '{}', {}:{}",
-                                            n, msg_s, file, line);
-                    if backtrace::log_enabled() {
-                        let _err = backtrace::write(stderr);
-                    }
-                    task = Local::take();
+                match task.stderr.take() {
+                    Some(mut stderr) => {
+                        Local::put(task);
 
-                    match mem::replace(&mut task.stderr, Some(stderr)) {
-                        Some(prev) => {
-                            Local::put(task);
-                            drop(prev);
-                            task = Local::take();
+                        // FIXME: what to do when the task printing fails?
+                        let _err = format_args!(|args| ::fmt::writeln(stderr, args),
+                                                "task '{}' failed at '{}', {}:{}",
+                                                n, msg_s, file, line);
+                        if backtrace::log_enabled() {
+                            let _err = backtrace::write(stderr);
                         }
-                        None => {}
+                        
+                        task = Local::take();
+
+                        match mem::replace(&mut task.stderr, Some(stderr)) {
+                            Some(prev) => {
+                                Local::put(task);
+                                drop(prev);
+                                task = Local::take();
+                            }
+                            None => {}
+                        }
                     }
-                }
-                None => {
-                    rterrln!("task '{}' failed at '{}', {}:{}", n, msg_s,
-                             file, line);
-                    if backtrace::log_enabled() {
-                        let mut err = ::rt::util::Stderr;
-                        let _err = backtrace::write(&mut err);
+                    None => {
+                        rterrln!("task '{}' failed at '{}', {}:{}", n, msg_s,
+                                 file, line);
+                        if backtrace::log_enabled() {
+                            let mut err = ::rt::util::Stderr;
+                            let _err = backtrace::write(&mut err);
+                        }
                     }
                 }
             }
+            task.name = name;
         }
-        task.name = name;
 
         if task.unwinder.unwinding {
             // If a task fails while it's already unwinding then we
